@@ -393,21 +393,28 @@ class LambdaFunction:
 
         if self.kind == LambdaType.DETECTOR:
             payload.update({
-                "image": self._get_image(db_task, mandatory_arg("frame"), quality)
+                "image": self._get_image(db_task, mandatory_arg("frame"), quality),
+                "task_id": db_task.id,
+                "frame": mandatory_arg("frame")
             })
         elif self.kind == LambdaType.INTERACTOR:
             payload.update({
                 "image": self._get_image(db_task, mandatory_arg("frame"), quality),
                 "pos_points": mandatory_arg("pos_points")[2:] if self.startswith_box else mandatory_arg("pos_points"),
                 "neg_points": mandatory_arg("neg_points"),
-                "obj_bbox": mandatory_arg("pos_points")[0:2] if self.startswith_box else None
+                "obj_bbox": mandatory_arg("pos_points")[0:2] if self.startswith_box else None,
+                "task_id": db_task.id,
+                "frame": mandatory_arg("frame")
             })
         elif self.kind == LambdaType.REID:
             payload.update({
                 "image0": self._get_image(db_task, mandatory_arg("frame0"), quality),
                 "image1": self._get_image(db_task, mandatory_arg("frame1"), quality),
                 "boxes0": mandatory_arg("boxes0"),
-                "boxes1": mandatory_arg("boxes1")
+                "boxes1": mandatory_arg("boxes1"),
+                "task_id": db_task.id,
+                "frame0": mandatory_arg("frame0"),
+                "frame1": mandatory_arg("frame1")
             })
             max_distance = data.get("max_distance")
             if max_distance:
@@ -418,7 +425,9 @@ class LambdaFunction:
             payload.update({
                 "image": self._get_image(db_task, mandatory_arg("frame"), quality),
                 "shapes": data.get("shapes", []),
-                "states": data.get("states", [])
+                "states": data.get("states", []),
+                "task_id": db_task.id,
+                "frame": mandatory_arg("frame")
             })
         else:
             raise ValidationError(
