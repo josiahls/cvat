@@ -375,19 +375,19 @@ class LambdaFunction:
         #     logger.debug("Finished update_mapping with result: %s", copy)
         #     return copy        
         def update_mapping(_mapping, _model_labels, _db_labels):
-            logger.debug("Starting update_mapping with _mapping: %s, _model_labels: %s, _db_labels: %s", _mapping, _model_labels, _db_labels)
+            # logger.debug("Starting update_mapping with _mapping: %s, _model_labels: %s, _db_labels: %s", _mapping, _model_labels, _db_labels)
             copy = deepcopy(_mapping)
             
             for model_label_name, mapping_item in copy.items():
                 try:
-                    logger.debug("Processing model_label_name: %s", model_label_name)
+                    # logger.debug("Processing model_label_name: %s", model_label_name)
                     md_label = next(filter(lambda x: x['name'] == model_label_name, _model_labels))
                     db_label = next(filter(lambda x: x.name == mapping_item['name'], _db_labels))
                     mapping_item.setdefault('attributes', {})
                     mapping_item['md_label'] = md_label
                     mapping_item['db_label'] = db_label
                     
-                    logger.debug("Mapped md_label: %s to db_label: %s", md_label, db_label)
+                    # logger.debug("Mapped md_label: %s to db_label: %s", md_label, db_label)
 
                     if md_label['type'] == 'skeleton' and db_label.type == 'skeleton':
                         mapping_item['sublabels'] = update_mapping(
@@ -395,7 +395,7 @@ class LambdaFunction:
                             md_label['sublabels'],
                             db_label.sublabels.all()
                         )
-                        logger.debug("Updated sublabels for label: %s", model_label_name)
+                        # logger.debug("Updated sublabels for label: %s", model_label_name)
 
                         # Ensure sublabel attributes are also mapped
                         for sub_md_label in md_label['sublabels']:
@@ -406,11 +406,11 @@ class LambdaFunction:
                                     attr['name']: attr['name'] for attr in sub_md_label['attributes']
                                 }
                                 mapping_item['sublabels'][sub_md_name]['attributes'] = sublabel_attr_mapping
-                                logger.debug("Mapped sublabel attributes for sublabel: %s - %s", sub_md_name, sublabel_attr_mapping)
+                                # logger.debug("Mapped sublabel attributes for sublabel: %s - %s", sub_md_name, sublabel_attr_mapping)
                 except Exception as e:
-                    logger.error("Error processing label: %s, Error: %s", model_label_name, e)
-            
-            logger.debug("Finished update_mapping with result: %s", copy)
+                    logger.error("Error processing label: %s, Error: %s", model_label_name, e)    
+                    logger.error("Finished update_mapping with result: %s", copy)
+                    raise
             return copy
 
 
@@ -553,58 +553,20 @@ class LambdaFunction:
             else:
                 return False
 
-        # def transform_attributes(input_attributes, attr_mapping, db_attributes):
-        #     attributes = []
-        #     for attr in input_attributes:
-        #         if attr['name'] not in attr_mapping:
-        #             logger.debug("Attribute %s not in mapping", attr['name'])
-        #             continue
-        #         db_attr_name = attr_mapping[attr['name']]
-        #         db_attr = next(filter(lambda x: x['name'] == db_attr_name, db_attributes), None)
-        #         if db_attr is not None and check_attr_value(attr['value'], db_attr):
-        #             attributes.append({
-        #                 'name': db_attr['name'],
-        #                 'value': attr['value']
-        #             })
-        #     return attributes
         def transform_attributes(input_attributes, attr_mapping, db_attributes):
             attributes = []
-            logger.debug("Starting transform_attributes")
-            logger.debug("Input Attributes: %s", input_attributes)
-            logger.debug("Attribute Mapping: %s", attr_mapping)
-            logger.debug("DB Attributes: %s", db_attributes)
-
-            db_attr_map = {attr['name']: attr for attr in db_attributes}
-            logger.debug("DB Attribute Map: %s", db_attr_map)
-
             for attr in input_attributes:
-                attr_name = attr['name']
-                attr_value = attr['value']
-                logger.debug("Processing Attribute: %s with value: %s", attr_name, attr_value)
-
-                if attr_name not in attr_mapping:
-                    logger.debug("Attribute %s not in mapping", attr_name)
+                if attr['name'] not in attr_mapping:
+                    logger.debug("Attribute %s not in mapping", attr['name'])
                     continue
-
-                db_attr_name = attr_mapping[attr_name]
-                db_attr = db_attr_map.get(db_attr_name)
-
-                if db_attr is not None:
-                    logger.debug("Found DB Attribute: %s", db_attr)
-                    if check_attr_value(attr_value, db_attr):
-                        attributes.append({
-                            'name': db_attr['name'],
-                            'value': attr_value
-                        })
-                        logger.debug("Added Transformed Attribute: %s with value: %s", db_attr['name'], attr_value)
-                    else:
-                        logger.debug("Attribute value %s is invalid for %s", attr_value, db_attr)
-                else:
-                    logger.debug("DB Attribute %s not found", db_attr_name)
-
-            logger.debug("Transformed Attributes: %s", attributes)
+                db_attr_name = attr_mapping[attr['name']]
+                db_attr = next(filter(lambda x: x['name'] == db_attr_name, db_attributes), None)
+                if db_attr is not None and check_attr_value(attr['value'], db_attr):
+                    attributes.append({
+                        'name': db_attr['name'],
+                        'value': attr['value']
+                    })
             return attributes
-
 
         if self.kind == LambdaType.DETECTOR:
             for item in response:
