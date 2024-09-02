@@ -13,6 +13,7 @@ services:
       no_proxy: ${no_proxy:-}
       NUCLIO_CHECK_FUNCTION_CONTAINERS_HEALTHINESS: 'true'
       NUCLIO_DASHBOARD_DEFAULT_FUNCTION_MOUNT_MODE: 'volume'
+      CVAT_NUCLIO_DEFAULT_TIMEOUT: '300'
     ports:
       - '8070:8070'
     logging:
