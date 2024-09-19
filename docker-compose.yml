@@ -391,5 +391,4 @@ volumes:
   cvat_cache_db:
 
 networks:
-  cvat::
-    external: true
+  cvat:

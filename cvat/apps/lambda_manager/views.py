@@ -128,9 +128,9 @@ class LambdaGateway:
     def _invoke_directly(self, func, payload):
         # host.docker.internal for Linux will work only with Docker 20.10+
         NUCLIO_TIMEOUT = settings.NUCLIO['DEFAULT_TIMEOUT']
-        NULCIO_HOST = settings.NULCIO['HOST']
-        if NULCIO_HOST != 'localhost':
-            url = f'http://{NULCIO_HOST}:{func.port}'
+        NUCLIO_HOST = settings.NUCLIO['HOST']
+        if NUCLIO_HOST != 'localhost':
+            url = f'http://{NUCLIO_HOST}:{func.port}'
         elif os.path.exists('/.dockerenv'): # inside a docker container
             url = f'http://host.docker.internal:{func.port}'
         else:
