@@ -2349,12 +2349,16 @@ export class MaskShape extends Shape {
                     redoWithUnderlyingPixels();
                     redo();
                 },
-                [this.clientID, ...clientIDs], frame,
+                [this.clientID, ...clientIDs],
+                frame,
             );
         } else {
             this.history.do(
                 HistoryActions.CHANGED_POINTS,
-                undo, redo, [this.clientID], frame,
+                undo,
+                redo,
+                [this.clientID],
+                frame,
             );
         }
     }
@@ -2914,7 +2918,7 @@ export class SkeletonTrack extends Track {
                 parentID: this.clientID,
                 readOnlyFields: ['group', 'zOrder', 'source', 'rotation'],
             });
-        }).sort((a: Annotation, b: Annotation) => a.label.id - b.label.id);
+        }).filter(Boolean).sort((a: Annotation, b: Annotation) => a.label.id - b.label.id);
     }
 
     public updateFromServerResponse(body: SerializedTrack): void {

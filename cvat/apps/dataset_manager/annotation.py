@@ -72,14 +72,26 @@ class AnnotationIR:
             # a <= b
             return 0 <= min(b, stop) - max(a, start)
 
+        elements = track.get('elements', [])
+        if elements:
+            # skeletons usually have only one shape defined on initial frame
+            # anyway, for them we decided if they are inside range based on child elements
+            return any(AnnotationIR._is_track_inside(t, start, stop) for t in elements)
+
         prev_shape = None
         for shape in track['shapes']:
+            if shape['frame'] == start and shape['outside']:
+                # corner case when the only shape on segment is outside frame on start frame
+                prev_shape = shape
+                continue
+
             if prev_shape and not prev_shape['outside'] and \
                     has_overlap(prev_shape['frame'], shape['frame']):
                 return True
+
             prev_shape = shape
 
-        if not prev_shape['outside'] and prev_shape['frame'] <= stop:
+        if prev_shape is not None and not prev_shape['outside'] and prev_shape['frame'] <= stop:
             return True
 
         return False
@@ -88,6 +100,8 @@ class AnnotationIR:
     def _slice_track(cls, track_, start, stop, dimension):
         def filter_track_shapes(shapes):
             shapes = [s for s in shapes if cls._is_shape_inside(s, start, stop)]
+
+            # remove leading outside shapes as they are not necessary
             drop_count = 0
             for s in shapes:
                 if s['outside']:
@@ -111,7 +125,7 @@ class AnnotationIR:
             scoped_shapes = filter_track_shapes(interpolated_shapes)
 
             if scoped_shapes:
-                last_key = sorted(track['shapes'], key=lambda s: s['frame'])[-1]['frame']
+                last_key = max(shape['frame'] for shape in track['shapes'])
                 if not scoped_shapes[0]['keyframe']:
                     segment_shapes.insert(0, scoped_shapes[0])
                 if last_key >= stop and scoped_shapes[-1]['points'] != segment_shapes[-1]['points']:
@@ -462,8 +476,11 @@ class TrackManager(ObjectManager):
 
             if track.get("elements"):
                 track_elements = TrackManager(track["elements"], self._dimension)
+                element_included_frames = set(track_shapes.keys())
+                if included_frames is not None:
+                    element_included_frames = element_included_frames.intersection(included_frames)
                 element_shapes = track_elements.to_shapes(end_frame,
-                    included_frames=set(track_shapes.keys()).intersection(included_frames or []),
+                    included_frames=element_included_frames,
                     include_outside=True, # elements are controlled by the parent shape
                     use_server_track_ids=use_server_track_ids
                 )
@@ -538,6 +555,8 @@ class TrackManager(ObjectManager):
             return 0
 
     def _modify_unmatched_object(self, obj, end_frame):
+        if not obj["shapes"]:
+            return
         shape = obj["shapes"][-1]
         if not shape["outside"]:
             shape = deepcopy(shape)

@@ -11,7 +11,6 @@ import os
 import textwrap
 from copy import deepcopy
 from datetime import timedelta
-from enum import Enum
 from functools import wraps
 from typing import Any, Dict, Optional
 
@@ -20,6 +19,7 @@ import django_rq
 import numpy as np
 import requests
 import rq
+from cvat.apps.events.handlers import handle_function_call
 from cvat.apps.lambda_manager.signals import interactive_function_call_signal
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
@@ -33,39 +33,22 @@ from rest_framework.request import Request
 
 import cvat.apps.dataset_manager as dm
 from cvat.apps.engine.frame_provider import FrameProvider
-from cvat.apps.engine.models import Job, ShapeType, SourceType, Task, Label
+from cvat.apps.engine.models import (
+    Job, ShapeType, SourceType, Task, Label, RequestAction, RequestTarget,
+)
+from cvat.apps.engine.rq_job_handler import RQId, RQJobMetaField
 from cvat.apps.engine.serializers import LabeledDataSerializer
+from cvat.apps.lambda_manager.models import FunctionKind
 from cvat.apps.lambda_manager.permissions import LambdaPermission
 from cvat.apps.lambda_manager.serializers import (
     FunctionCallRequestSerializer, FunctionCallSerializer
 )
+from cvat.apps.engine.log import ServerLogManager
 from cvat.apps.engine.utils import define_dependent_job, get_rq_job_meta, get_rq_lock_by_user
 from cvat.utils.http import make_requests_session
 from cvat.apps.iam.filters import ORGANIZATION_OPEN_API_PARAMETERS
 
-
-import logging
-
-logger = logging.getLogger(__name__)
-# logger.setLevel(logging.DEBUG)
-
-# Ensure logging output
-# handler = logging.StreamHandler()
-# formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-# handler.setFormatter(formatter)
-# logger.addHandler(handler)
-
-
-
-class LambdaType(Enum):
-    DETECTOR = "detector"
-    INTERACTOR = "interactor"
-    REID = "reid"
-    TRACKER = "tracker"
-    UNKNOWN = "unknown"
-
-    def __str__(self):
-        return self.value
+slogger = ServerLogManager(__name__)
 
 class LambdaGateway:
     NUCLIO_ROOT_URL = '/api/functions'
@@ -102,8 +85,11 @@ class LambdaGateway:
 
     def list(self):
         data = self._http(url=self.NUCLIO_ROOT_URL)
-        response = [LambdaFunction(self, item) for item in data.values()]
-        return response
+        for item in data.values():
+            try:
+                yield LambdaFunction(self, item)
+            except InvalidFunctionMetadataError:
+                slogger.glob.error("Failed to parse lambda function metadata", exc_info=True)
 
     def get(self, func_id):
         data = self._http(url=self.NUCLIO_ROOT_URL + '/' + func_id)
@@ -143,7 +129,16 @@ class LambdaGateway:
 
         return response
 
+class InvalidFunctionMetadataError(Exception):
+    pass
+
 class LambdaFunction:
+    FRAME_PARAMETERS = (
+        ('frame', 'frame'),
+        ('frame0', 'start frame'),
+        ('frame1', 'end frame'),
+    )
+
     def __init__(self, gateway, data):
         # ID of the function (e.g. omz.public.yolo-v3)
         self.id = data['metadata']['name']
@@ -151,9 +146,10 @@ class LambdaFunction:
         meta_anno = data['metadata']['annotations']
         kind = meta_anno.get('type')
         try:
-            self.kind = LambdaType(kind)
-        except ValueError:
-            self.kind = LambdaType.UNKNOWN
+            self.kind = FunctionKind(kind)
+        except ValueError as e:
+            raise InvalidFunctionMetadataError(
+                f"{self.id} lambda function has unknown type: {kind!r}") from e
         # dictionary of labels for the function (e.g. car, person)
         spec = json.loads(meta_anno.get('spec') or '[]')
 
@@ -166,9 +162,8 @@ class LambdaFunction:
                 } for attr in attrs_spec]
 
                 if len(parsed_attributes) != len({attr['name'] for attr in attrs_spec}):
-                    raise ValidationError(
-                        f"{self.id} lambda function has non-unique attributes",
-                        code=status.HTTP_404_NOT_FOUND)
+                    raise InvalidFunctionMetadataError(
+                        f"{self.id} lambda function has non-unique attributes")
 
                 return parsed_attributes
 
@@ -187,9 +182,8 @@ class LambdaFunction:
                 parsed_labels.append(parsed_label)
 
             if len(parsed_labels) != len({label['name'] for label in spec}):
-                raise ValidationError(
-                    f"{self.id} lambda function has non-unique labels",
-                    code=status.HTTP_404_NOT_FOUND)
+                raise InvalidFunctionMetadataError(
+                    f"{self.id} lambda function has non-unique labels")
 
             return parsed_labels
 
@@ -198,11 +192,8 @@ class LambdaFunction:
         self.func_attributes = {item['name']: item.get('attributes', []) for item in spec}
         for label, attributes in self.func_attributes.items():
             if len([attr['name'] for attr in attributes]) != len(set([attr['name'] for attr in attributes])):
-                raise ValidationError(
-                    "`{}` lambda function has non-unique attributes for label {}".format(self.id, label),
-                    code=status.HTTP_404_NOT_FOUND)
-        # state of the function
-        self.state = data['status']['state']
+                raise InvalidFunctionMetadataError(
+                    "`{}` lambda function has non-unique attributes for label {}".format(self.id, label))
         # description of the function
         self.description = data['spec']['description']
         # http port to access the serverless function
@@ -214,6 +205,7 @@ class LambdaFunction:
         self.min_pos_points = int(meta_anno.get('min_pos_points', 1))
         self.min_neg_points = int(meta_anno.get('min_neg_points', -1))
         self.startswith_box = bool(meta_anno.get('startswith_box', False))
+        self.startswith_box_optional = bool(meta_anno.get('startswith_box_optional', False))
         self.animated_gif = meta_anno.get('animated_gif', '')
         self.version = int(meta_anno.get('version', '1'))
         self.help_message = meta_anno.get('help_message', '')
@@ -231,20 +223,21 @@ class LambdaFunction:
             'version': self.version
         }
 
-        if self.kind is LambdaType.INTERACTOR:
+        if self.kind is FunctionKind.INTERACTOR:
             response.update({
                 'min_pos_points': self.min_pos_points,
                 'min_neg_points': self.min_neg_points,
                 'startswith_box': self.startswith_box,
+                'startswith_box_optional': self.startswith_box_optional,
                 'help_message': self.help_message,
                 'animated_gif': self.animated_gif
             })
 
-        if self.kind is LambdaType.TRACKER:
+        if self.kind is FunctionKind.TRACKER:
             response.update({
                 'state': self.state
             })
-        if self.kind is LambdaType.DETECTOR:
+        if self.kind is FunctionKind.DETECTOR:
             response.update({
                 'attributes': self.func_attributes
             })
@@ -284,7 +277,7 @@ class LambdaFunction:
         mapping = data.get("mapping", {})
 
         model_labels = self.labels
-        task_labels = db_task.get_labels().prefetch_related('attributespec_set')
+        task_labels = db_task.get_labels(prefetch=True)
 
         def labels_compatible(model_label: Dict, task_label: Label) -> bool:
             model_type = model_label['type']
@@ -302,9 +295,9 @@ class LambdaFunction:
                     if task_label.name == model_label['name'] and labels_compatible(model_label, task_label):
                         attributes_default_mapping = {}
                         for model_attr in model_label.get('attributes', {}):
-                            for db_attr in model_label.attributespec_set.all():
+                            for db_attr in task_label.attributespec_set.all():
                                 if db_attr.name == model_attr['name']:
-                                    attributes_default_mapping[model_attr] = db_attr.name
+                                    attributes_default_mapping[model_attr['name']] = db_attr.name
 
                         mapping_by_default[model_label['name']] = {
                             'name': task_label.name,
@@ -411,8 +404,8 @@ class LambdaFunction:
                                 mapping_item['sublabels'][sub_md_name]['attributes'] = sublabel_attr_mapping
                                 # logger.debug("Mapped sublabel attributes for sublabel: %s - %s", sub_md_name, sublabel_attr_mapping)
                 except Exception as e:
-                    logger.error("Error processing label: %s, Error: %s", model_label_name, e)
-                    logger.error("Finished update_mapping with result: %s", copy)
+                    slogger.error("Error processing label: %s, Error: %s", model_label_name, e)
+                    slogger.error("Finished update_mapping with result: %s", copy)
                     raise
             return copy
 
@@ -456,6 +449,11 @@ class LambdaFunction:
                 )
 
                 if md_label['type'] == 'skeleton' and db_label.type == 'skeleton':
+                    if 'sublabels' not in mapping_item:
+                        raise ValidationError(
+                            f'Mapping for elements was not specified in skeleton "{model_label_name}" '
+                        )
+
                     validate_labels_mapping(
                         mapping_item['sublabels'],
                         md_label['sublabels'],
@@ -475,11 +473,7 @@ class LambdaFunction:
             data_start_frame = task_data.start_frame
             step = task_data.get_frame_step()
 
-            for key, desc in (
-                ('frame', 'frame'),
-                ('frame0', 'start frame'),
-                ('frame1', 'end frame'),
-            ):
+            for key, desc in self.FRAME_PARAMETERS:
                 if key not in data:
                     continue
 
@@ -489,22 +483,22 @@ class LambdaFunction:
                         code=status.HTTP_400_BAD_REQUEST)
 
 
-        if self.kind == LambdaType.DETECTOR:
+        if self.kind == FunctionKind.DETECTOR:
             payload.update({
                 "image": self._get_image(db_task, mandatory_arg("frame"), quality),
                 "task_id": db_task.id,
                 "frame": mandatory_arg("frame")
             })
-        elif self.kind == LambdaType.INTERACTOR:
+        elif self.kind == FunctionKind.INTERACTOR:
             payload.update({
                 "image": self._get_image(db_task, mandatory_arg("frame"), quality),
-                "pos_points": mandatory_arg("pos_points")[2:] if self.startswith_box else mandatory_arg("pos_points"),
+                "pos_points": mandatory_arg("pos_points"),
                 "neg_points": mandatory_arg("neg_points"),
-                "obj_bbox": mandatory_arg("pos_points")[0:2] if self.startswith_box else None,
+                "obj_bbox": data.get("obj_bbox", None),
                 "task_id": db_task.id,
                 "frame": mandatory_arg("frame")
             })
-        elif self.kind == LambdaType.REID:
+        elif self.kind == FunctionKind.REID:
             payload.update({
                 "image0": self._get_image(db_task, mandatory_arg("frame0"), quality),
                 "image1": self._get_image(db_task, mandatory_arg("frame1"), quality),
@@ -519,7 +513,7 @@ class LambdaFunction:
                 payload.update({
                     "max_distance": max_distance
                 })
-        elif self.kind == LambdaType.TRACKER:
+        elif self.kind == FunctionKind.TRACKER:
             payload.update({
                 "image": self._get_image(db_task, mandatory_arg("frame"), quality),
                 "shapes": data.get("shapes", []),
@@ -560,7 +554,7 @@ class LambdaFunction:
             attributes = []
             for attr in input_attributes:
                 if attr['name'] not in attr_mapping:
-                    logger.debug("Attribute %s not in mapping", attr['name'])
+                    slogger.debug("Attribute %s not in mapping", attr['name'])
                     continue
                 db_attr_name = attr_mapping[attr['name']]
                 db_attr = next(filter(lambda x: x['name'] == db_attr_name, db_attributes), None)
@@ -571,7 +565,7 @@ class LambdaFunction:
                     })
             return attributes
 
-        if self.kind == LambdaType.DETECTOR:
+        if self.kind == FunctionKind.DETECTOR:
             for item in response:
                 # print('item: ', item)
                 item_label = item['label']
@@ -651,16 +645,31 @@ class LambdaQueue:
         *,
         job: Optional[int] = None
     ) -> LambdaJob:
-        jobs = self.get_jobs()
+        queue = self._get_queue()
+        rq_id = RQId(RequestAction.AUTOANNOTATE, RequestTarget.TASK, task).render()
+
         # It is still possible to run several concurrent jobs for the same task.
         # But the race isn't critical. The filtration is just a light-weight
         # protection.
-        if list(filter(lambda job: job.get_task() == task and not job.is_finished, jobs)):
+        rq_job = queue.fetch_job(rq_id)
+
+        have_conflict = rq_job and \
+            rq_job.get_status(refresh=False) not in {rq.job.JobStatus.FAILED, rq.job.JobStatus.FINISHED}
+
+        # There could be some jobs left over from before the current naming convention was adopted.
+        # TODO: remove this check after a few releases.
+        have_legacy_conflict = any(
+            job.get_task() == task and not (job.is_finished or job.is_failed)
+            for job in self.get_jobs()
+        )
+        if have_conflict or have_legacy_conflict:
             raise ValidationError(
                 "Only one running request is allowed for the same task #{}".format(task),
                 code=status.HTTP_409_CONFLICT)
 
-        queue = self._get_queue()
+        if rq_job:
+            rq_job.delete()
+
         # LambdaJob(None) is a workaround for python-rq. It has multiple issues
         # with invocation of non-trivial functions. For example, it cannot run
         # staticmethod, it cannot run a callable class. Thus I provide an object
@@ -669,6 +678,7 @@ class LambdaQueue:
 
         with get_rq_lock_by_user(queue, user_id):
             rq_job = queue.create_job(LambdaJob(None),
+                job_id=rq_id,
                 meta={
                     **get_rq_job_meta(
                         request,
@@ -676,6 +686,7 @@ class LambdaQueue:
                             Job.objects.get(pk=job) if job else Task.objects.get(pk=task)
                         ),
                     ),
+                    RQJobMetaField.FUNCTION_ID: lambda_func.id,
                     "lambda": True,
                 },
                 kwargs={
@@ -1081,13 +1092,13 @@ class LambdaJob:
                     labels[label.name]['attributes'][attr['name']] = attr['id']
             return labels
 
-        labels = convert_labels(db_task.get_labels().prefetch_related('attributespec_set'))
+        labels = convert_labels(db_task.get_labels(prefetch=True))
 
-        if function.kind == LambdaType.DETECTOR:
+        if function.kind == FunctionKind.DETECTOR:
             cls._call_detector(function, db_task, labels, quality,
                 kwargs.get("threshold"), kwargs.get("mapping"), kwargs.get("conv_mask_to_poly"),
                 db_job=db_job)
-        elif function.kind == LambdaType.REID:
+        elif function.kind == FunctionKind.REID:
             cls._call_reid(function, db_task, quality,
                 kwargs.get("threshold"), kwargs.get("max_distance"), db_job=db_job)
 
@@ -1189,13 +1200,25 @@ class FunctionViewSet(viewsets.ViewSet):
         gateway = LambdaGateway()
         lambda_func = gateway.get(func_id)
 
-        return lambda_func.invoke(
+        response = lambda_func.invoke(
             db_task,
             request.data, # TODO: better to add validation via serializer for these data
             db_job=job,
             is_interactive=True,
             request=request
         )
+
+        handle_function_call(func_id, db_task,
+            category="interactive",
+            parameters={
+                param_name: param_value
+                for param_name, _ in LambdaFunction.FRAME_PARAMETERS
+                for param_value in [request.data.get(param_name)]
+                if param_value is not None
+            },
+        )
+
+        return response
 
 @extend_schema(tags=['lambda'])
 @extend_schema_view(
@@ -1287,6 +1310,8 @@ class RequestViewSet(viewsets.ViewSet):
         lambda_func = gateway.get(function)
         rq_job = queue.enqueue(lambda_func, threshold, task, quality,
             mapping, cleanup, conv_mask_to_poly, max_distance, request, job=job)
+
+        handle_function_call(function, job or task, category="batch")
 
         response_serializer = FunctionCallSerializer(rq_job.to_dict())
         return response_serializer.data
