@@ -130,7 +130,7 @@ class LambdaGateway:
         NUCLIO_TIMEOUT = settings.NUCLIO['DEFAULT_TIMEOUT']
         NUCLIO_HOST = settings.NUCLIO['HOST']
         if NUCLIO_HOST != 'localhost':
-            url = f'http://{NUCLIO_HOST}:{func.port}'
+            url = f'http://{NUCLIO_HOST}:{func.port}/'
         elif os.path.exists('/.dockerenv'): # inside a docker container
             url = f'http://host.docker.internal:{func.port}'
         else:
