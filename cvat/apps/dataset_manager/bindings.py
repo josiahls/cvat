@@ -12,7 +12,7 @@ from functools import reduce
 from operator import add
 from pathlib import Path
 from types import SimpleNamespace
-from typing import (Any, Callable, DefaultDict, Dict, Iterable, List, Literal, Mapping,
+from typing import (Any, Callable, DefaultDict, Dict, Iterable, Iterator, List, Literal, Mapping,
                     NamedTuple, Optional, OrderedDict, Sequence, Set, Tuple, Union)
 
 from attrs.converters import to_bool
@@ -30,6 +30,7 @@ from django.conf import settings
 
 from cvat.apps.dataset_manager.formats.utils import get_label_color
 from cvat.apps.dataset_manager.util import add_prefetch_fields
+from cvat.apps.engine import models
 from cvat.apps.engine.frame_provider import TaskFrameProvider, FrameQuality, FrameOutputType
 from cvat.apps.engine.models import (AttributeSpec, AttributeType, DimensionType, Job,
                                      JobType, Label, LabelType, Project, SegmentType, ShapeType,
@@ -265,10 +266,10 @@ class CommonData(InstanceLabelData):
         type: str | None
 
     def __init__(self,
-        annotation_ir,
-        db_task,
+        annotation_ir: AnnotationIR,
+        db_task: Task,
         *,
-        host='',
+        host: str = '',
         create_callback=None,
         use_server_track_ids: bool = False,
         included_frames: Optional[Sequence[int]] = None
@@ -281,9 +282,10 @@ class CommonData(InstanceLabelData):
         self._frame_info = {}
         self._frame_mapping: Dict[str, int] = {}
         self._frame_step = db_task.data.get_frame_step()
-        self._db_data = db_task.data
+        self._db_data: models.Data = db_task.data
         self._use_server_track_ids = use_server_track_ids
         self._required_frames = included_frames
+        self._initialized_included_frames: Optional[Set[int]] = None
         self._db_subset = db_task.subset
 
         super().__init__(db_task)
@@ -303,7 +305,7 @@ class CommonData(InstanceLabelData):
     def stop(self) -> int:
         return max(0, len(self) - 1)
 
-    def _get_queryset(self):
+    def _get_db_images(self) -> Iterator[models.Image]:
         raise NotImplementedError()
 
     def abs_frame_id(self, relative_id):
@@ -334,7 +336,6 @@ class CommonData(InstanceLabelData):
                 } for frame in self.rel_range
             }
         else:
-            queryset = self._get_queryset()
             self._frame_info = {
                 self.rel_frame_id(db_image.frame): {
                     "id": db_image.id,
@@ -342,7 +343,7 @@ class CommonData(InstanceLabelData):
                     "width": db_image.width,
                     "height": db_image.height,
                     "subset": self._db_subset,
-                } for db_image in queryset
+                } for db_image in self._get_db_images()
             }
 
         self._frame_mapping = {
@@ -491,9 +492,12 @@ class CommonData(InstanceLabelData):
             for idx in sorted(set(self._frame_info) & included_frames):
                 get_frame(idx)
 
-        anno_manager = AnnotationManager(self._annotation_ir)
+        anno_manager = AnnotationManager(
+            self._annotation_ir, dimension=self._annotation_ir.dimension
+        )
         for shape in sorted(
-            anno_manager.to_shapes(self.stop + 1, self._annotation_ir.dimension,
+            anno_manager.to_shapes(
+                self.stop + 1,
                 # Skip outside, deleted and excluded frames
                 included_frames=included_frames,
                 include_outside=False,
@@ -533,12 +537,14 @@ class CommonData(InstanceLabelData):
                 yield self._export_labeled_shape(shape)
 
     def get_included_frames(self):
-        return set(
-            i for i in self.rel_range
-            if not self._is_frame_deleted(i)
-            and not self._is_frame_excluded(i)
-            and self._is_frame_required(i)
-        )
+        if self._initialized_included_frames is None:
+            self._initialized_included_frames = set(
+                i for i in self.rel_range
+                if not self._is_frame_deleted(i)
+                and not self._is_frame_excluded(i)
+                and self._is_frame_required(i)
+            )
+        return self._initialized_included_frames
 
     def _is_frame_deleted(self, frame):
         return frame in self._deleted_frames
@@ -745,7 +751,7 @@ class CommonData(InstanceLabelData):
 
 class JobData(CommonData):
     META_FIELD = "job"
-    def __init__(self, annotation_ir, db_job, **kwargs):
+    def __init__(self, annotation_ir: AnnotationIR, db_job: Job, **kwargs):
         self._db_job = db_job
         self._db_task = db_job.segment.task
 
@@ -805,18 +811,18 @@ class JobData(CommonData):
                 if self.abs_frame_id(frame) not in frame_set
             )
 
+            if self.db_instance.type == JobType.GROUND_TRUTH:
+                self._excluded_frames.update(self.db_data.validation_layout.disabled_frames)
+
         if self._required_frames:
-            abs_range = self.abs_range
-            self._required_frames = set(
-                self.abs_frame_id(frame) for frame in self._required_frames
-                if frame in abs_range
-            )
+            rel_range = self.rel_range
+            self._required_frames = set(frame for frame in self._required_frames if frame in rel_range)
 
     def __len__(self):
         segment = self._db_job.segment
         return segment.stop_frame - segment.start_frame + 1
 
-    def _get_queryset(self):
+    def _get_db_images(self):
         return (image for image in self._db_data.images.all() if image.frame in self.abs_range)
 
     @property
@@ -849,7 +855,7 @@ class JobData(CommonData):
 
 class TaskData(CommonData):
     META_FIELD = "task"
-    def __init__(self, annotation_ir, db_task, **kwargs):
+    def __init__(self, annotation_ir: AnnotationIR, db_task: Task, **kwargs):
         self._db_task = db_task
         super().__init__(annotation_ir, db_task, **kwargs)
 
@@ -925,8 +931,30 @@ class TaskData(CommonData):
     def db_instance(self):
         return self._db_task
 
-    def _get_queryset(self):
+    def _get_db_images(self):
         return self._db_data.images.all()
+
+    def _init_frame_info(self):
+        super()._init_frame_info()
+
+        if self.db_data.validation_mode == models.ValidationMode.GT_POOL:
+            # For GT pool-enabled tasks, we:
+            # - skip validation frames in normal jobs on annotation export
+            # - load annotations for GT pool frames on annotation import
+
+            assert not hasattr(self.db_data, 'video')
+
+            for db_image in self._get_db_images():
+                # We should not include placeholder frames in task export, so we exclude them
+                if db_image.is_placeholder:
+                    self._excluded_frames.add(db_image.frame)
+                    continue
+
+                # We should not match placeholder frames during task import,
+                # so we update the frame matching index
+                self._frame_mapping[self._get_filename(db_image.path)] = (
+                    self.rel_frame_id(db_image.frame)
+                )
 
 class ProjectData(InstanceLabelData):
     META_FIELD = 'project'
@@ -1087,7 +1115,10 @@ class ProjectData(InstanceLabelData):
                 } for frame in range(task.data.size)})
             else:
                 self._frame_info.update({(task.id, self.rel_frame_id(task.id, db_image.frame)): {
-                    "path": mangle_image_name(db_image.path, defaulted_subset, original_names),
+                    # do not modify honeypot names since they will be excluded from the dataset
+                    # and their quantity should not affect the validation frame name
+                    "path": mangle_image_name(db_image.path, defaulted_subset, original_names) \
+                        if not db_image.is_placeholder else db_image.path,
                     "id": db_image.id,
                     "width": db_image.width,
                     "height": db_image.height,
@@ -1246,22 +1277,35 @@ class ProjectData(InstanceLabelData):
             return frames[(frame_info["subset"], abs_frame)]
 
         if include_empty:
-            for ident in sorted(self._frame_info):
-                if ident not in self._deleted_frames:
-                    get_frame(*ident)
+            for task_id, frame in sorted(self._frame_info):
+                if not self._tasks_data.get(task_id):
+                    self.init_task_data(task_id)
 
-        for task in self._db_tasks.values():
-            anno_manager = AnnotationManager(self._annotation_irs[task.id])
+                task_included_frames = self._tasks_data[task_id].get_included_frames()
+                if frame in task_included_frames:
+                    get_frame(task_id, frame)
+
+        for task_data in self.task_data:
+            task: Task = task_data.db_instance
+
+            anno_manager = AnnotationManager(
+                self._annotation_irs[task.id], dimension=self._annotation_irs[task.id].dimension
+            )
+            task_included_frames = task_data.get_included_frames()
+
             for shape in sorted(
                 anno_manager.to_shapes(
-                    task.data.size, self._annotation_irs[task.id].dimension,
+                    task.data.size,
+                    included_frames=task_included_frames,
                     include_outside=False,
                     use_server_track_ids=self._use_server_track_ids
                 ),
                 key=lambda shape: shape.get("z_order", 0)
             ):
-                if (task.id, shape['frame']) not in self._frame_info or (task.id, shape['frame']) in self._deleted_frames:
+                if shape['frame'] in task_data.deleted_frames:
                     continue
+
+                assert (task.id, shape['frame']) in self._frame_info
 
                 if 'track_id' in shape:
                     if shape['outside']:
@@ -1341,23 +1385,33 @@ class ProjectData(InstanceLabelData):
         for task_data in self._tasks_data.values():
             task_data.soft_attribute_import = value
 
+
+    def init_task_data(self, task_id: int) -> TaskData:
+        try:
+            task = self._db_tasks[task_id]
+        except KeyError as ex:
+            raise Exception("There is no such task in the project") from ex
+
+        task_data = TaskData(
+            annotation_ir=self._annotation_irs[task_id],
+            db_task=task,
+            host=self._host,
+            create_callback=self._task_annotations[task_id].create \
+                if self._task_annotations is not None else None,
+        )
+        task_data._MAX_ANNO_SIZE //= len(self._db_tasks)
+        task_data.soft_attribute_import = self.soft_attribute_import
+        self._tasks_data[task_id] = task_data
+
+        return task_data
+
     @property
     def task_data(self):
-        for task_id, task in self._db_tasks.items():
+        for task_id in self._db_tasks.keys():
             if task_id in self._tasks_data:
                 yield self._tasks_data[task_id]
             else:
-                task_data = TaskData(
-                    annotation_ir=self._annotation_irs[task_id],
-                    db_task=task,
-                    host=self._host,
-                    create_callback=self._task_annotations[task_id].create \
-                        if self._task_annotations is not None else None,
-                )
-                task_data._MAX_ANNO_SIZE //= len(self._db_tasks)
-                task_data.soft_attribute_import = self.soft_attribute_import
-                self._tasks_data[task_id] = task_data
-                yield task_data
+                yield self.init_task_data(task_id)
 
     @staticmethod
     def _get_filename(path):

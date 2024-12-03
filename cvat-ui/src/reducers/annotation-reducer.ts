@@ -51,19 +51,24 @@ const defaultState: AnnotationState = {
         instance: null,
         ready: false,
         activeControl: ActiveControl.CURSOR,
+        activeObjectHidden: false,
     },
     job: {
         openTime: null,
         labels: [],
         requestedId: null,
-        groundTruthJobFramesMeta: null,
-        groundTruthInstance: null,
         queryParameters: {
             initialOpenGuide: false,
             defaultLabel: null,
             defaultPointsCount: null,
         },
+        groundTruthInfo: {
+            validationLayout: null,
+            groundTruthJobFramesMeta: null,
+            groundTruthInstance: null,
+        },
         instance: null,
+        meta: null,
         attributes: {},
         fetching: false,
         saving: false,
@@ -89,6 +94,9 @@ const defaultState: AnnotationState = {
         activeShapeType: ShapeType.RECTANGLE,
         activeLabelID: null,
         activeObjectType: ObjectType.SHAPE,
+    },
+    editing: {
+        objectState: null,
     },
     annotations: {
         activatedStateID: null,
@@ -155,6 +163,7 @@ export default (state = defaultState, action: AnyAction): AnnotationState => {
         case AnnotationActionTypes.GET_JOB_SUCCESS: {
             const {
                 job,
+                jobMeta,
                 openTime,
                 frameNumber: number,
                 frameFilename: filename,
@@ -165,6 +174,7 @@ export default (state = defaultState, action: AnyAction): AnnotationState => {
                 queryParameters,
                 groundTruthInstance,
                 groundTruthJobFramesMeta,
+                validationLayout,
             } = action.payload;
 
             const defaultLabel = job.labels.length ? job.labels[0] : null;
@@ -201,14 +211,18 @@ export default (state = defaultState, action: AnyAction): AnnotationState => {
                     openTime,
                     fetching: false,
                     instance: job,
+                    meta: jobMeta,
                     labels: job.labels,
                     attributes: job.labels
                         .reduce((acc: Record<number, any[]>, label: any): Record<number, any[]> => {
                             acc[label.id] = label.attributes;
                             return acc;
                         }, {}),
-                    groundTruthInstance,
-                    groundTruthJobFramesMeta,
+                    groundTruthInfo: {
+                        validationLayout,
+                        groundTruthInstance,
+                        groundTruthJobFramesMeta,
+                    },
                     queryParameters: {
                         initialOpenGuide: queryParameters.initialOpenGuide,
                         defaultLabel: queryParameters.defaultLabel,
@@ -623,6 +637,26 @@ export default (state = defaultState, action: AnyAction): AnnotationState => {
                 },
             };
         }
+        case AnnotationActionTypes.UPDATE_EDITED_STATE: {
+            const { objectState } = action.payload;
+            return {
+                ...state,
+                editing: {
+                    ...state.editing,
+                    objectState,
+                },
+            };
+        }
+        case AnnotationActionTypes.HIDE_ACTIVE_OBJECT: {
+            const { hide } = action.payload;
+            return {
+                ...state,
+                canvas: {
+                    ...state.canvas,
+                    activeObjectHidden: hide,
+                },
+            };
+        }
         case AnnotationActionTypes.REMOVE_OBJECT_SUCCESS: {
             const { objectState, history } = action.payload;
             const contextMenuClientID = state.canvas.contextMenu.clientID;
@@ -970,7 +1004,7 @@ export default (state = defaultState, action: AnyAction): AnnotationState => {
         }
         case AnnotationActionTypes.CHANGE_WORKSPACE: {
             const { workspace } = action.payload;
-            if (state.canvas.activeControl !== ActiveControl.CURSOR) {
+            if (state.canvas.activeControl !== ActiveControl.CURSOR && state.workspace !== Workspace.SINGLE_SHAPE) {
                 return state;
             }
 
@@ -982,6 +1016,11 @@ export default (state = defaultState, action: AnyAction): AnnotationState => {
                     states: state.annotations.states.filter((_state) => !_state.isGroundTruth),
                     activatedStateID: null,
                     activatedAttributeID: null,
+
+                },
+                canvas: {
+                    ...state.canvas,
+                    activeControl: ActiveControl.CURSOR,
                 },
             };
         }
